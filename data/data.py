@@ -85,6 +85,7 @@ def _flatten(raw: dict) -> dict:
         "last": trade.get("price"),
         "close": day.get("close"),  # day's last trade price; available without a quotes plan
         "volume": day.get("volume"),
+        "day_updated": day.get("last_updated"),  # ns timestamp of the day bar
         "open_interest": raw.get("open_interest"),
         "implied_volatility": raw.get("implied_volatility"),
         "delta": greeks.get("delta"),

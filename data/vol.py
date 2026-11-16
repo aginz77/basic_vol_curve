@@ -90,6 +90,83 @@ def _price(c: dict) -> tuple[float | None, str]:
     return c.get("close"), "close"
 
 
+MIN_PRICE = 0.05  # below this, tick size alone swings IV wildly
+
+
+def usable_contracts(chain: list[dict]) -> list[dict]:
+    """Drop contracts whose last-trade price is likely stale or too small to trust.
+
+    Without a quotes plan prices are last trades, so a contract that did not trade in
+    the latest session (or traded on an older day than the rest of the chain) was
+    priced when the underlying was elsewhere.
+    """
+    traded = [c for c in chain if (c.get("volume") or 0) > 0
+              and (_price(c)[0] or 0) >= MIN_PRICE]
+    if any(c.get("mid") for c in traded):
+        return traded  # real quotes: freshness is not an issue
+    stamps = [c["day_updated"] for c in traded if c.get("day_updated")]
+    if not stamps:
+        return traded
+    latest = dt.datetime.fromtimestamp(max(stamps) / 1e9, dt.timezone.utc).date()
+    return [c for c in traded if not c.get("day_updated") or
+            dt.datetime.fromtimestamp(c["day_updated"] / 1e9, dt.timezone.utc).date() == latest]
+
+
+def clean_rows(rows: list[dict], rel_tol=0.25, abs_tol=0.05, edge_rel_tol=0.4) -> list[dict]:
+    """Remove spikes from one expiry's IV-by-delta curve, then fill interior gaps.
+
+    A point is a spike if it is further than max(rel_tol * expected, abs_tol) from the
+    line through its neighbours (edges: extrapolated from the two inner points, with the
+    looser edge_rel_tol since wings legitimately curve up). The worst spike is removed
+    first and the check repeats. Interior gaps are then filled linearly in delta and
+    flagged with filled=True; the ends of the curve are never extrapolated.
+    """
+    x = [r["target_delta"] for r in rows]
+    iv = [r["iv"] for r in rows]
+
+    def expected(i, have):
+        left = [j for j in have if j < i]
+        right = [j for j in have if j > i]
+        if left and right:
+            a, b = left[-1], right[0]
+        elif len(right) >= 2:
+            a, b = right[0], right[1]
+        elif len(left) >= 2:
+            a, b = left[-2], left[-1]
+        else:
+            return None, None
+        e = iv[a] + (iv[b] - iv[a]) * (x[i] - x[a]) / (x[b] - x[a])
+        return e, (rel_tol if left and right else edge_rel_tol)
+
+    for _ in range(len(rows)):
+        have = [i for i, v in enumerate(iv) if v is not None]
+        if len(have) < 4:
+            break
+        worst, worst_excess = None, 0.0
+        for i in have:
+            e, tol = expected(i, [j for j in have if j != i])
+            if e is None or e <= 0:
+                continue
+            excess = abs(iv[i] - e) - max(tol * e, abs_tol)
+            if excess > worst_excess:
+                worst, worst_excess = i, excess
+        if worst is None:
+            break
+        rows[worst] = {**rows[worst], "iv": None, "dropped_iv": iv[worst]}
+        iv[worst] = None
+
+    have = [i for i, v in enumerate(iv) if v is not None]
+    for i in range(len(rows)):
+        if iv[i] is None and have and have[0] < i < have[-1]:
+            a = max(j for j in have if j < i)
+            b = min(j for j in have if j > i)
+            w = (x[i] - x[a]) / (x[b] - x[a])
+            sa, sb = rows[a]["strike"], rows[b]["strike"]
+            rows[i] = {**rows[i], "iv": iv[a] + w * (iv[b] - iv[a]), "filled": True,
+                       "strike": sa + w * (sb - sa) if sa and sb else rows[i]["strike"]}
+    return rows
+
+
 def implied_forward(chain: list[dict], spot: float, T: float, r: float) -> dict:
     """F = K0 + e^{rT} (C - P) at the strike K0 closest to spot with both prices."""
     calls = {c["strike"]: c for c in chain if c["type"] == "call" and _price(c)[0]}
@@ -110,6 +187,7 @@ def expiry_curve(chain: list[dict], expiry: str, spot: float, r: float,
     """Forward-consistent IV by call-equivalent delta for one expiry's calls + puts."""
     days = (dt.date.fromisoformat(expiry) - dt.date.today()).days
     T = days / 365
+    chain = usable_contracts(chain)
     fwd = implied_forward(chain, spot, T, r)
     F = fwd["forward"]
 
@@ -150,7 +228,7 @@ def expiry_curve(chain: list[dict], expiry: str, spot: float, r: float,
                            iv=best["iv"] if err <= max_delta_error else None)
         rows.append(row)
 
-    return {"expiry": expiry, "days": days, "T": T, "rate": r, **fwd, "rows": rows}
+    return {"expiry": expiry, "days": days, "T": T, "rate": r, **fwd, "rows": clean_rows(rows)}
 
 
 def forward_iv_surface(symbol="SPY", tenors=DEFAULT_TENORS, deltas=DEFAULT_DELTAS,
@@ -186,6 +264,9 @@ def forward_iv_surface(symbol="SPY", tenors=DEFAULT_TENORS, deltas=DEFAULT_DELTA
             ec = expiry_curve(chain, expiry, spot, rate_for_days(curve, days),
                               deltas, max_delta_error)
         except MassiveError:
+            return None
+        # An expiry with fewer than half its points is too illiquid to plot.
+        if sum(r["iv"] is not None for r in ec["rows"]) < len(deltas) / 2:
             return None
         return {"tenor": label, **ec}
 
